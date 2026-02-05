@@ -28,7 +28,7 @@ class AeroHandNode(Node):
     def __init__(self):
         super().__init__("aero_hand_node")
         ## Parameters
-        self.declare_parameter("right_port", "/dev/ttyACM0")
+        self.declare_parameter("right_port", "")
         self.declare_parameter("left_port", "")
         self.declare_parameter("baudrate", 921600)
         self.declare_parameter("feedback_frequency", 100.0)

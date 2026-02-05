@@ -48,231 +48,599 @@ _DEG_TO_RAD = 3.141592653589793 / 180.0
 import threading
 import queue
 import asyncio
+import struct
+import time
+from typing import Optional, Tuple, Dict, Any, Callable, List
+from dataclasses import dataclass
 from bleak import BleakClient
+
+try:
+    from serial import Serial
+except ImportError:
+    Serial = None
+
+
+@dataclass
+class FrameConfig:
+    """帧配置"""
+    header: bytes           # 帧头标识
+    frame_size: int        # 完整帧大小（包括header和crc）
+    payload_format: str    # struct格式字符串，如 "<28H" 表示28个小端uint16
+    queue_name: str        # 对应的队列名称
+    description: str       # 描述信息
+
+
+class ProtocolConfig:
+    """协议配置类 - 在这里修改你的协议定义"""
+    
+    # ============ 修改区域开始 ============
+    
+    # 帧头定义
+    HEADER_CMD = b'\xA1\xA2\xA3\xA4'
+    HEADER_STATE = b'\xA5\xA6\xA7\xA8'
+    
+    # 发送命令时使用的帧头
+    SEND_HEADER = HEADER_CMD
+    
+    # CRC多项式（如果需要更改CRC算法，修改 _calc_crc8 方法）
+    CRC_POLYNOMIAL = 0x07
+    
+    # 蓝牙UUID配置
+    BLE_SERVICE_UUID = "0000abb0-0000-1000-8000-00805f9b34fb"
+    BLE_CHAR_STATE_UUID = "0000abb1-0000-1000-8000-00805f9b34fb"  # 接收状态推送
+    BLE_CHAR_WRITE_UUID = "0000abb2-0000-1000-8000-00805f9b34fb"  # 发送命令
+    BLE_CHAR_READ_UUID = "0000abb3-0000-1000-8000-00805f9b34fb"   # 接收命令回复
+    
+    # 帧结构定义（添加新的帧类型只需在这里添加）
+    FRAME_CONFIGS = [
+        FrameConfig(
+            header=HEADER_CMD,
+            frame_size=21,      # 4(header) + 16(payload) + 1(crc)
+            payload_format="16s",  # 16字节原始数据
+            queue_name="cmd_response",
+            description="命令响应帧"
+        ),
+        FrameConfig(
+            header=HEADER_STATE,
+            frame_size=61,      # 4(header) + 56(payload) + 1(crc)
+            payload_format="<28H",  # 28个uint16小端
+            queue_name="motor_state",
+            description="电机状态帧"
+        ),
+        # 添加新的帧类型示例：
+        # FrameConfig(
+        #     header=b'\xB1\xB2\xB3\xB4',
+        #     frame_size=33,
+        #     payload_format="<4f3H2B",  # 4个float + 3个uint16 + 2个uint8
+        #     queue_name="sensor_data",
+        #     description="传感器数据帧"
+        # ),
+    ]
+    
+    # 发送命令的payload格式
+    SEND_PAYLOAD_SIZE = 16
+    SEND_PAYLOAD_FORMAT = "16s"  # 可以改成其他格式，如 "<4f" (4个float)
+    
+    # ============ 修改区域结束 ============
+    
+    @classmethod
+    def get_frame_by_header(cls, header: bytes) -> Optional[FrameConfig]:
+        """根据帧头查找帧配置"""
+        for config in cls.FRAME_CONFIGS:
+            if config.header == header:
+                return config
+        return None
+    
+    @classmethod
+    def get_all_headers(cls) -> List[bytes]:
+        """获取所有帧头"""
+        return [config.header for config in cls.FRAME_CONFIGS]
+
+
 class FakeSerial:
-    def __init__(self, port_or_mac, baudrate=921600, bluetooth=False, debug=True):
+    """支持蓝牙和串口的双模通信类"""
+    
+    def __init__(self, port_or_mac: str, baudrate: int = 921600, 
+                 bluetooth: bool = False, debug: bool = True,
+                 protocol_config: type = ProtocolConfig):
+        """
+        初始化通信类
+        
+        Args:
+            port_or_mac: 串口名称或蓝牙MAC地址
+            baudrate: 波特率（仅串口模式）
+            bluetooth: 是否使用蓝牙模式
+            debug: 是否输出调试信息
+            protocol_config: 协议配置类（可以传入自定义配置）
+        """
         self.bluetooth = bluetooth
         self.debug = debug
         self.running = True
+        self.protocol = protocol_config
         
-        # 队列定义
-        self.payload_queue = queue.Queue()  # 标准 16 字节返回包 (Opcode 回复)
-        self.state_queue = queue.Queue()    # 新增：61 字节电机状态包 (JointState)
+        # 动态创建队列（根据配置）
+        self.queues: Dict[str, queue.Queue] = {}
+        for config in self.protocol.FRAME_CONFIGS:
+            self.queues[config.queue_name] = queue.Queue(maxsize=100)
         
+        # 接收缓冲区
         self.buffer = bytearray()
+        self._buffer_lock = threading.Lock()
         
-        # 协议定义
-        self.HEADER = b'\xA1\xA2\xA3\xA4'
-        self.CMD_FRAME_SIZE = 21   # 4(Header) + 16(Payload) + 1(CRC)
-        self.STATE_FRAME_SIZE = 61 # 4(Header) + 56(28*uint16) + 1(CRC)
-
-        # 蓝牙配置常量
-        self.SVC_UUID = "0000abb0-0000-1000-8000-00805f9b34fb" 
-        self.CHAR_STATE_UUID = "0000abb1-0000-1000-8000-00805f9b34fb" # 新增：订阅电机状态
-        self.CHAR_WRITE_UUID = "0000abb2-0000-1000-8000-00805f9b34fb" 
-        self.CHAR_READ_UUID = "0000abb3-0000-1000-8000-00805f9b34fb" # 用于命令回复
-
+        # 创建帧头到配置的映射（加速查找）
+        self._header_map: Dict[bytes, FrameConfig] = {
+            config.header: config for config in self.protocol.FRAME_CONFIGS
+        }
+        
+        # 初始化传输层
         if not bluetooth:
-            self._log(f"[INIT] 正在打开串口: {port_or_mac}")
-            self.ser = Serial(port_or_mac, baudrate, timeout=0.01, write_timeout=0.01)
+            self._init_serial(port_or_mac, baudrate)
         else:
-            self._log(f"[INIT] 蓝牙模式初始化, MAC: {port_or_mac}")
-            self.mac = port_or_mac
-            self.ble_write_queue = asyncio.Queue() 
-            self._loop_ref = None 
-            
-            self.bt_loop_thread = threading.Thread(target=self._start_bt_loop, daemon=True)
-            self.bt_loop_thread.start()
-            
-            while self._loop_ref is None:
-                time.sleep(0.1)
+            self._init_bluetooth(port_or_mac)
         
-        self.parse_thread = threading.Thread(target=self._read_and_parse_loop, daemon=True)
+        # 启动解析线程
+        self.parse_thread = threading.Thread(
+            target=self._read_and_parse_loop, 
+            daemon=True, 
+            name="ParseThread"
+        )
         self.parse_thread.start()
+        
+        self._log(f"[INIT] 协议配置加载完成，支持 {len(self.protocol.FRAME_CONFIGS)} 种帧类型")
 
-    def _log(self, msg):
-        if self.debug: print(msg)
+    def _init_serial(self, port: str, baudrate: int):
+        """初始化串口连接"""
+        if Serial is None:
+            raise ImportError("pyserial not installed. Run: pip install pyserial")
+        
+        self._log(f"[INIT] 正在打开串口: {port}")
+        self.ser = Serial(port, baudrate, timeout=0.01, write_timeout=0.01)
+        self._log(f"[INIT] 串口已打开: {port} @ {baudrate}")
+
+    def _init_bluetooth(self, mac: str):
+        """初始化蓝牙连接"""
+        self._log(f"[INIT] 蓝牙模式初始化, MAC: {mac}")
+        self.mac = mac
+        self.ble_write_queue = asyncio.Queue()
+        self._loop_ref = None
+        self._client_ref = None
+        
+        # 启动蓝牙事件循环线程
+        self.bt_loop_thread = threading.Thread(
+            target=self._start_bt_loop, 
+            daemon=True, 
+            name="BLEThread"
+        )
+        self.bt_loop_thread.start()
+        
+        # 等待事件循环初始化（带超时）
+        timeout = 5
+        start_time = time.time()
+        while self._loop_ref is None:
+            if time.time() - start_time > timeout:
+                raise TimeoutError("蓝牙事件循环初始化超时")
+            time.sleep(0.1)
+        
+        self._log("[INIT] 蓝牙事件循环已启动")
+
+    def _log(self, msg: str):
+        """日志输出"""
+        if self.debug:
+            print(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
     def _start_bt_loop(self):
+        """启动蓝牙异步事件循环"""
         self._loop_ref = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop_ref)
-        self._loop_ref.run_until_complete(self._bt_manager_task())
+        try:
+            self._loop_ref.run_until_complete(self._bt_manager_task())
+        except Exception as e:
+            self._log(f"[BLE_FATAL] 事件循环异常退出: {e}")
+        finally:
+            self._loop_ref.close()
 
     async def _bt_manager_task(self):
+        """蓝牙连接管理任务（自动重连）"""
+        retry_count = 0
+        max_retries = 3
+        
         while self.running:
             try:
-                self._log(f"[BLE] 尝试连接 {self.mac}...")
-                async with BleakClient(self.mac, timeout=10.0, mtu_size=517) as client:
-                    self._log(f"[BLE] 已连接. MTU={client.mtu_size}")
+                self._log(f"[BLE] 尝试连接 {self.mac}... (尝试 {retry_count + 1})")
+                
+                async with BleakClient(
+                    self.mac, 
+                    timeout=15.0,
+                    disconnected_callback=self._on_disconnect
+                ) as client:
+                    self._client_ref = client
+                    self._log(f"[BLE] 已连接 {self.mac}")
                     
-                    # 订阅特征 1：标准命令回复 (0xABB3)
-                    await client.start_notify(self.CHAR_READ_UUID, self._ble_data_handler)
-                    # 订阅特征 2：电机状态推送 (0xABB1)
-                    await client.start_notify(self.CHAR_STATE_UUID, self._ble_data_handler)
+                    retry_count = 0
                     
+                    # 订阅通知特征（根据配置动态订阅）
+                    if hasattr(self.protocol, 'BLE_CHAR_READ_UUID'):
+                        await client.start_notify(
+                            self.protocol.BLE_CHAR_READ_UUID, 
+                            self._ble_data_handler
+                        )
+                    
+                    if hasattr(self.protocol, 'BLE_CHAR_STATE_UUID'):
+                        await client.start_notify(
+                            self.protocol.BLE_CHAR_STATE_UUID, 
+                            self._ble_data_handler
+                        )
+                    
+                    self._log("[BLE] 已订阅所有通知特征")
+                    
+                    # 写入循环
                     while client.is_connected and self.running:
                         try:
-                            data = await asyncio.wait_for(self.ble_write_queue.get(), timeout=0.01)
+                            data = await asyncio.wait_for(
+                                self.ble_write_queue.get(), 
+                                timeout=0.1
+                            )
+                            
                             if data is None:
-                                print("none")
-                                break 
-                            await client.write_gatt_char(self.CHAR_WRITE_UUID, data, response=False)
+                                self._log("[BLE] 收到退出信号")
+                                break
+                            
+                            await client.write_gatt_char(
+                                self.protocol.BLE_CHAR_WRITE_UUID, 
+                                data, 
+                                response=False
+                            )
+                            
                         except asyncio.TimeoutError:
                             continue
+                        except Exception as e:
+                            self._log(f"[BLE_WRITE_ERR] {e}")
+                            break
+                            
             except Exception as e:
-                if self.running:
+                if not self.running:
+                    break
+                
+                retry_count += 1
+                if retry_count >= max_retries:
+                    self._log(f"[BLE_ERR] 达到最大重试次数，等待30秒...")
+                    await asyncio.sleep(30)
+                    retry_count = 0
+                else:
                     self._log(f"[BLE_ERR] {e}. 5秒后重连...")
                     await asyncio.sleep(5)
+            finally:
+                self._client_ref = None
 
-    def _ble_data_handler(self, sender, data):
-        self.buffer.extend(data)
+    def _on_disconnect(self, client):
+        """蓝牙断开回调"""
+        self._log(f"[BLE] 设备已断开: {client.address}")
 
-    def _calc_crc8(self, data: bytes):
+    def _ble_data_handler(self, sender, data: bytearray):
+        """蓝牙数据接收回调"""
+        with self._buffer_lock:
+            self.buffer.extend(data)
+
+    def _calc_crc8(self, data: bytes) -> int:
+        """CRC8校验计算
+        
+        如果需要更改CRC算法，修改这个方法
+        """
         crc = 0x00
+        polynomial = self.protocol.CRC_POLYNOMIAL
+        
         for byte in data:
             crc ^= byte
             for _ in range(8):
                 if crc & 0x80:
-                    crc = (crc << 1) ^ 0x07
+                    crc = (crc << 1) ^ polynomial
                 else:
                     crc <<= 1
                 crc &= 0xFF
         return crc
 
     def _read_and_parse_loop(self):
-        """解析引擎：根据帧头 A1-A4 (命令) 和 A5-A8 (状态) 进行分流"""
-        # 定义帧头常量
-        HEADER_CMD = b'\xA1\xA2\xA3\xA4'
-        HEADER_STATE = b'\xA5\xA6\xA7\xA8'
-        
+        """数据解析主循环"""
         while self.running:
+            # 从传输层读取数据
             if not self.bluetooth:
                 if self.ser.in_waiting > 0:
-                    self.buffer.extend(self.ser.read(self.ser.in_waiting))
+                    with self._buffer_lock:
+                        self.buffer.extend(self.ser.read(self.ser.in_waiting))
                 else:
                     time.sleep(0.001)
             else:
                 time.sleep(0.001)
 
-            # 只要缓冲区足够判断一个头部
-            while len(self.buffer) >= 4:
-                # 寻找两个可能的帧头位置
-                pos_cmd = self.buffer.find(HEADER_CMD)
-                pos_state = self.buffer.find(HEADER_STATE)
+            # 解析缓冲区
+            with self._buffer_lock:
+                self._parse_buffer()
 
-                # 确定哪一个头更靠前
-                positions = [p for p in [pos_cmd, pos_state] if p != -1]
-                if not positions:
-                    # 没找到任何头，保留末尾 3 字节防止头断裂，其余删除
-                    if len(self.buffer) > 3 :
-                        del self.buffer[:-3]
-                    break
-                
-                first_header_pos = min(positions)
-                if first_header_pos > 0:
-                    del self.buffer[:first_header_pos]
+    def _parse_buffer(self):
+        """解析缓冲区中的数据帧"""
+        all_headers = self.protocol.get_all_headers()
+        
+        while len(self.buffer) >= 4:
+            # 查找所有可能的帧头位置
+            header_positions = {}
+            for header in all_headers:
+                pos = self.buffer.find(header)
+                if pos != -1:
+                    header_positions[pos] = header
+            
+            if not header_positions:
+                # 未找到任何帧头，保留末尾3字节
+                if len(self.buffer) > 3:
+                    del self.buffer[:-3]
+                break
+            
+            # 找到最近的帧头
+            first_pos = min(header_positions.keys())
+            if first_pos > 0:
+                del self.buffer[:first_pos]
+            
+            # 获取当前帧头对应的配置
+            current_header = header_positions[first_pos]
+            frame_config = self._header_map.get(current_header)
+            
+            if frame_config and not self._parse_frame(frame_config):
+                break
 
-                # 再次确认当前 buffer 开头是什么包
-                if self.buffer.startswith(HEADER_STATE):
-                    # --- 处理 61 字节状态包 ---
-                    if len(self.buffer) < self.STATE_FRAME_SIZE:
-                        break # 数据不够一包，等下次
-                    
-                    frame = self.buffer[:self.STATE_FRAME_SIZE]
-                    if self._calc_crc8(frame[:-1]) == frame[-1]:
-                        # payload 长度为 56 字节 (28个 uint16)
-                        # < 表示小端，28H 表示 28 个无符号短整型
-                        payload = struct.unpack("<28H", frame[4:60])
-                        self.state_queue.put(payload)
-                        del self.buffer[:self.STATE_FRAME_SIZE]
-                    else:
-                        self._log("[CRC_ERR] 状态包校验失败")
-                        del self.buffer[:1]
+    def _parse_frame(self, config: FrameConfig) -> bool:
+        """通用帧解析方法
+        
+        Args:
+            config: 帧配置
+            
+        Returns:
+            bool: 是否继续解析（False表示数据不足，需要等待）
+        """
+        if len(self.buffer) < config.frame_size:
+            return False
+        
+        frame = bytes(self.buffer[:config.frame_size])
+        
+        # CRC校验
+        if self._calc_crc8(frame[:-1]) != frame[-1]:
+            self._log(f"[CRC_ERR] {config.description} 校验失败")
+            del self.buffer[:1]
+            return True
+        
+        # 提取payload（跳过header和crc）
+        header_len = len(config.header)
+        payload_bytes = frame[header_len:-1]
+        
+        # 解析payload
+        try:
+            if config.payload_format == "raw":
+                # 原始字节
+                parsed_data = payload_bytes
+            else:
+                # 使用struct解析
+                parsed_data = struct.unpack(config.payload_format, payload_bytes)
+                # 如果只有一个元素，解包
+                if len(parsed_data) == 1:
+                    parsed_data = parsed_data[0]
+            
+            # 放入对应队列
+            target_queue = self.queues.get(config.queue_name)
+            if target_queue:
+                try:
+                    target_queue.put_nowait(parsed_data)
+                except queue.Full:
+                    # 队列满，丢弃旧数据
+                    try:
+                        target_queue.get_nowait()
+                        target_queue.put_nowait(parsed_data)
+                    except queue.Empty:
+                        pass
+            
+            del self.buffer[:config.frame_size]
+            
+        except struct.error as e:
+            self._log(f"[PARSE_ERR] {config.description} 解析失败: {e}")
+            del self.buffer[:1]
+        
+        return True
 
-                elif self.buffer.startswith(HEADER_CMD):
-                    # --- 处理 21 字节命令回复包 ---
-                    if len(self.buffer) < self.CMD_FRAME_SIZE:
-                        break
-                    
-                    frame = self.buffer[:self.CMD_FRAME_SIZE]
-                    if self._calc_crc8(frame[:-1]) == frame[-1]:
-                        self.payload_queue.put(frame[4:20])
-                        del self.buffer[:self.CMD_FRAME_SIZE]
-                    else:
-                        self._log("[CRC_ERR] 命令包校验失败")
-                        del self.buffer[:1]
-    def get_latest_state(self):
-        """获取最新的电机状态包（非阻塞）"""
+    # ========== 高层API：根据配置自动生成 ==========
+    
+    def get_data(self, queue_name: str, timeout: float = 1.0) -> Any:
+        """从指定队列读取数据（阻塞）
+        
+        Args:
+            queue_name: 队列名称（如 'cmd_response', 'motor_state'）
+            timeout: 超时时间
+            
+        Returns:
+            解析后的数据，超时返回None
+        """
+        target_queue = self.queues.get(queue_name)
+        if not target_queue:
+            raise ValueError(f"Unknown queue name: {queue_name}")
+        
+        try:
+            return target_queue.get(block=True, timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def get_latest_data(self, queue_name: str) -> Any:
+        """获取指定队列的最新数据（非阻塞）
+        
+        Args:
+            queue_name: 队列名称
+            
+        Returns:
+            最新数据，队列为空返回None
+        """
+        target_queue = self.queues.get(queue_name)
+        if not target_queue:
+            raise ValueError(f"Unknown queue name: {queue_name}")
+        
         latest = None
-        while not self.state_queue.empty():
+        while True:
             try:
-                latest = self.state_queue.get_nowait()
+                latest = target_queue.get_nowait()
             except queue.Empty:
                 break
-        return latest # 返回 tuple (pos0, pos1, ..., temp6) 或 None
+        return latest
 
-    def read(self, size=16):
-        try:
-            return self.payload_queue.get(block=True, timeout=1.0)
-        except queue.Empty:
-            return b''
+    # ========== 兼容旧API ==========
+    
+    def read(self, size: int = 16, timeout: float = 1.0) -> bytes:
+        """读取命令响应包（兼容旧代码）"""
+        data = self.get_data('cmd_response', timeout)
+        return data if data is not None else b''
 
-    def write(self, msg):
-        if len(msg) != 16: raise ValueError("msg must be 16 bytes")
-        full_frame = self.HEADER + msg
-        final_packet = full_frame + struct.pack("B", self._calc_crc8(full_frame))
+    def get_latest_state(self) -> Optional[Tuple]:
+        """获取最新的电机状态包（兼容旧代码）"""
+        return self.get_latest_data('motor_state')
+
+    # ========== 发送方法 ==========
+    
+    def write(self, payload: bytes) -> int:
+        """发送命令
+        
+        Args:
+            payload: payload数据（长度由配置决定）
+        
+        Returns:
+            int: 实际发送的字节数
+        """
+        expected_size = self.protocol.SEND_PAYLOAD_SIZE
+        if len(payload) != expected_size:
+            raise ValueError(f"payload must be {expected_size} bytes, got {len(payload)}")
+        
+        # 构造完整帧
+        full_frame = self.protocol.SEND_HEADER + payload
+        crc = self._calc_crc8(full_frame)
+        final_packet = full_frame + struct.pack("B", crc)
+        
+        if self.bluetooth:
+            if not self._loop_ref or not self._loop_ref.is_running():
+                raise RuntimeError("蓝牙事件循环未运行")
+            
+            # 清空写队列（只保留最新命令）
+            while True:
+                try:
+                    self.ble_write_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            
+            # 线程安全地放入队列
+            future = asyncio.run_coroutine_threadsafe(
+                self.ble_write_queue.put(final_packet),
+                self._loop_ref
+            )
+            
+            try:
+                future.result(timeout=1.0)
+            except Exception as e:
+                self._log(f"[WRITE_ERR] 蓝牙写入失败: {e}")
+                return 0
+        else:
+            try:
+                self.ser.write(final_packet)
+            except Exception as e:
+                self._log(f"[WRITE_ERR] 串口写入失败: {e}")
+                return 0
+        
+        return len(final_packet)
+
+    def write_structured(self, format_str: str, *values) -> int:
+        """发送结构化数据
+        
+        Args:
+            format_str: struct格式字符串，如 "<4f" 表示4个小端float
+            *values: 要发送的值
+            
+        Example:
+            conn.write_structured("<4f", 1.0, 2.0, 3.0, 4.0)
+        """
+        payload = struct.pack(format_str, *values)
+        
+        # 检查是否需要填充
+        expected_size = self.protocol.SEND_PAYLOAD_SIZE
+        if len(payload) < expected_size:
+            payload += b'\x00' * (expected_size - len(payload))
+        elif len(payload) > expected_size:
+            raise ValueError(f"Packed data too large: {len(payload)} > {expected_size}")
+        
+        return self.write(payload)
+
+    def reset_input_buffer(self):
+        """清空输入缓冲"""
+        self._log("[RESET] 清空输入缓冲")
+        
+        with self._buffer_lock:
+            self.buffer.clear()
+        
+        # 清空所有队列
+        for q in self.queues.values():
+            while True:
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
+        
+        if not self.bluetooth:
+            self.ser.reset_input_buffer()
+
+    def reset_output_buffer(self):
+        """清空输出缓冲"""
+        if not self.bluetooth:
+            self.ser.reset_output_buffer()
+
+    def flush(self):
+        """刷新输出缓冲"""
+        if not self.bluetooth:
+            self.ser.flush()
+
+    def is_connected(self) -> bool:
+        """检查连接状态"""
+        if self.bluetooth:
+            return (self._client_ref is not None and 
+                    self._client_ref.is_connected)
+        else:
+            return hasattr(self, 'ser') and self.ser.is_open
+
+    def close(self):
+        """关闭连接并释放资源"""
+        self._log("[CLOSE] 正在关闭连接...")
+        self.running = False
         
         if self.bluetooth:
             if self._loop_ref and self._loop_ref.is_running():
                 try:
-                    while not self.ble_write_queue.empty():
-                        self.ble_write_queue.get_nowait()
-                except: 
+                    future = asyncio.run_coroutine_threadsafe(
+                        self.ble_write_queue.put(None),
+                        self._loop_ref
+                    )
+                    future.result(timeout=1.0)
+                except Exception:
                     pass
                 
-                self._loop_ref.call_soon_threadsafe(self.ble_write_queue.put_nowait, final_packet)
-        else:
-            self.ser.write(final_packet)
-        return len(final_packet)
-    
-    def reset_input_buffer(self):
-        self._log("[RESET] 输入缓冲已清理")
-        if not self.bluetooth: self.ser.reset_input_buffer()
-        self.buffer.clear()
-        while not self.payload_queue.empty():
-            try: self.payload_queue.get_nowait()
-            except queue.Empty: break
-
-    def reset_output_buffer(self):
-        if not self.bluetooth: self.ser.reset_output_buffer()
-
-    def flush(self):
-        if not self.bluetooth: self.ser.flush()
-
-    async def _async_close_ble(self):
-        """蓝牙异步清理逻辑"""
-        try:
-            await self.ble_write_queue.put(None) # 唤醒并终止队列等待
-        except Exception:
-            pass
-
-    def close(self):
-        self._log("[CLOSE] 正在启动关闭程序...")
-        self.running = False 
-
-        if self.bluetooth:
-            if self._loop_ref and self._loop_ref.is_running():
-                # 通知异步逻辑结束
-                asyncio.run_coroutine_threadsafe(self._async_close_ble(), self._loop_ref)
-                time.sleep(0.5) # 给一点时间处理断开
+                time.sleep(0.5)
                 self._loop_ref.call_soon_threadsafe(self._loop_ref.stop)
+                
+                if self.bt_loop_thread.is_alive():
+                    self.bt_loop_thread.join(timeout=2.0)
         else:
             if hasattr(self, 'ser') and self.ser.is_open:
                 self.ser.close()
                 self._log("[CLOSE] 串口已关闭")
-
+        
+        if self.parse_thread.is_alive():
+            self.parse_thread.join(timeout=2.0)
+        
         self._log("[CLOSE] 资源已释放")
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
 class AeroHand:
     def __init__(self, port=None, baudrate=921600,bluetooth=False):
         ## Connect to serial port
