@@ -1,20 +1,7 @@
-#!/usr/bin/env python3
-# Copyright 2025 TetherIA, Inc.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import rclpy
 from rclpy.node import Node
+import signal
+import sys
 
 from aero_hand_open_msgs.msg import JointControl, ActuatorStates, ActuatorControl
 
@@ -34,7 +21,6 @@ class AeroHandNode(Node):
         self.declare_parameter("feedback_frequency", 100.0)
         self.declare_parameter("control_space", "joint")
         self.declare_parameter("bluetooth", False)
-        #self.declare_parameter("control_space", "actuator")
 
         right_port = self.get_parameter("right_port").value
         left_port = self.get_parameter("left_port").value
@@ -42,10 +28,11 @@ class AeroHandNode(Node):
         feedback_frequency = self.get_parameter("feedback_frequency").value
         control_space = self.get_parameter("control_space").value
         bluetooth = bool(self.get_parameter("bluetooth").value)
+        
         ## Initialize hands and subscribers/publishers based on provided ports
         if right_port != "":
             try:
-                self.right_hand = AeroHand(port=right_port, baudrate=baudrate,bluetooth=bluetooth)
+                self.right_hand = AeroHand(port=right_port, baudrate=baudrate, bluetooth=bluetooth)
             except Exception as e:
                 self.get_logger().error(
                     f"Failed to initialize Right hand on port {right_port}: {e}"
@@ -77,7 +64,7 @@ class AeroHandNode(Node):
 
         if left_port != "":
             try:
-                self.left_hand = AeroHand(port=left_port, baudrate=baudrate,bluetooth=bluetooth)
+                self.left_hand = AeroHand(port=left_port, baudrate=baudrate, bluetooth=bluetooth)
             except Exception as e:
                 self.get_logger().error(
                     f"Failed to initialize Left hand on port {left_port}: {e}"
@@ -128,6 +115,30 @@ class AeroHandNode(Node):
 
         self.get_logger().info("Aero hand node has been started.")
 
+    def cleanup(self):
+        """清理资源"""
+        self.get_logger().info("Cleaning up resources...")
+        
+        if hasattr(self, "right_hand"):
+            try:
+                self.get_logger().info("Closing right hand connection...")
+                self.right_hand.close()  # 假设 AeroHand 有 close 方法
+            except Exception as e:
+                self.get_logger().error(f"Error closing right hand: {e}")
+        
+        if hasattr(self, "left_hand"):
+            try:
+                self.get_logger().info("Closing left hand connection...")
+                self.left_hand.close()
+            except Exception as e:
+                self.get_logger().error(f"Error closing left hand: {e}")
+        
+        self.get_logger().info("Cleanup complete.")
+
+    def __del__(self):
+        """析构函数"""
+        self.cleanup()
+
     def feedback_callback(self):
         if hasattr(self, "right_hand"):
             right_hand_state = ActuatorStates()
@@ -143,7 +154,6 @@ class AeroHandNode(Node):
                     self.right_hand.get_actuator_temperatures()
                 )
             except Exception as e:
-                # self.get_logger().warn(f"Error getting right hand state")
                 return
             self.hand_state_pub_right.publish(right_hand_state)
 
@@ -161,7 +171,6 @@ class AeroHandNode(Node):
                     self.left_hand.get_actuator_temperatures()
                 )
             except Exception as e:
-                # self.get_logger().warn(f"Error getting left hand state. Error: {e}")
                 return
             self.hand_state_pub_left.publish(left_hand_state)
 
@@ -174,7 +183,6 @@ class AeroHandNode(Node):
                 f"Expected 16 joint positions for right hand, but got {len(msg.target_positions)}."
             )
             return
-        # Debug: log incoming message
         try:
             self.get_logger().debug(
                 f"right/joint_control received len={len(msg.target_positions)} first_vals={msg.target_positions[:4]}"
@@ -182,7 +190,6 @@ class AeroHandNode(Node):
         except Exception:
             pass
 
-        ## Clamp the joint values to the limits
         joint_values = [np.rad2deg(jv) for jv in msg.target_positions]
         joint_values = np.clip(joint_values, self.joint_ll, self.joint_ul).tolist()
         try:
@@ -224,7 +231,6 @@ class AeroHandNode(Node):
                 f"Expected 7 actuator positions for right hand, but got {len(msg.actuation_positions)}."
             )
             return
-        ## Clamp the actuator values to the limits
         actuation_values = np.clip(
             msg.actuation_positions, self.actuator_ll, self.actuator_ul
         ).tolist()
@@ -248,7 +254,6 @@ class AeroHandNode(Node):
             self.get_logger().warn(
                 f"Expected 7 actuator positions for left hand, but got {len(msg.actuation_positions)}."
             )
-
             return
         actuation_values = np.clip(
             msg.actuation_positions, self.actuator_ll, self.actuator_ul
@@ -270,9 +275,16 @@ class AeroHandNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     aero_hand_node = AeroHandNode()
-    rclpy.spin(aero_hand_node)
-    aero_hand_node.destroy_node()
-    rclpy.shutdown()
+    
+    try:
+        rclpy.spin(aero_hand_node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # 确保清理资源
+        aero_hand_node.cleanup()
+        aero_hand_node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":
