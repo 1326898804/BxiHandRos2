@@ -122,7 +122,7 @@ class AeroHandNode(Node):
         if hasattr(self, "right_hand"):
             try:
                 self.get_logger().info("Closing right hand connection...")
-                self.right_hand.close()  # 假设 AeroHand 有 close 方法
+                self.right_hand.close()
             except Exception as e:
                 self.get_logger().error(f"Error closing right hand: {e}")
         

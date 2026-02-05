@@ -50,9 +50,10 @@ import queue
 import asyncio
 import struct
 import time
-from typing import Optional, Tuple, Dict, Any, Callable, List
-from dataclasses import dataclass
+from typing import Optional, Tuple, Dict, Any, List
+from dataclasses import dataclass, field
 from bleak import BleakClient
+from collections import deque
 
 try:
     from serial import Serial
@@ -63,69 +64,184 @@ except ImportError:
 @dataclass
 class FrameConfig:
     """帧配置"""
-    header: bytes           # 帧头标识
-    frame_size: int        # 完整帧大小（包括header和crc）
-    payload_format: str    # struct格式字符串，如 "<28H" 表示28个小端uint16
-    queue_name: str        # 对应的队列名称
-    description: str       # 描述信息
+    header: bytes
+    frame_size: int
+    payload_format: str
+    queue_name: str
+    description: str
+
+
+@dataclass
+class Statistics:
+    """通信统计信息"""
+    # 接收统计
+    rx_bytes: int = 0              # 接收总字节数
+    rx_frames: int = 0             # 接收总帧数
+    rx_frames_ok: int = 0          # 接收成功帧数
+    rx_frames_crc_err: int = 0     # CRC错误帧数
+    rx_frames_parse_err: int = 0   # 解析错误帧数
+    
+    # 发送统计
+    tx_bytes: int = 0              # 发送总字节数
+    tx_frames: int = 0             # 发送总帧数
+    tx_frames_failed: int = 0      # 发送失败帧数
+    
+    # 速率统计（使用滑动窗口，最近1秒）
+    rx_rate_window: deque = field(default_factory=lambda: deque(maxlen=100))
+    tx_rate_window: deque = field(default_factory=lambda: deque(maxlen=100))
+    
+    # 按帧类型统计
+    frame_type_stats: Dict[str, int] = field(default_factory=dict)
+    
+    # 连接统计
+    connect_time: Optional[float] = None
+    disconnect_count: int = 0
+    reconnect_count: int = 0
+    
+    # 延迟统计（需要时间戳）
+    latency_samples: deque = field(default_factory=lambda: deque(maxlen=100))
+    
+    def get_rx_rate(self) -> float:
+        """获取接收速率（字节/秒）"""
+        if len(self.rx_rate_window) < 2:
+            return 0.0
+        
+        time_span = self.rx_rate_window[-1][0] - self.rx_rate_window[0][0]
+        if time_span <= 0:
+            return 0.0
+        
+        total_bytes = sum(size for _, size in self.rx_rate_window)
+        return total_bytes / time_span
+    
+    def get_tx_rate(self) -> float:
+        """获取发送速率（字节/秒）"""
+        if len(self.tx_rate_window) < 2:
+            return 0.0
+        
+        time_span = self.tx_rate_window[-1][0] - self.tx_rate_window[0][0]
+        if time_span <= 0:
+            return 0.0
+        
+        total_bytes = sum(size for _, size in self.tx_rate_window)
+        return total_bytes / time_span
+    
+    def get_frame_rate(self, frame_type: str = None) -> float:
+        """获取帧速率（帧/秒）"""
+        if frame_type:
+            count = self.frame_type_stats.get(frame_type, 0)
+            uptime = self.get_uptime()
+            return count / uptime if uptime > 0 else 0.0
+        else:
+            uptime = self.get_uptime()
+            return self.rx_frames_ok / uptime if uptime > 0 else 0.0
+    
+    def get_error_rate(self) -> float:
+        """获取错误率"""
+        total = self.rx_frames
+        if total == 0:
+            return 0.0
+        errors = self.rx_frames_crc_err + self.rx_frames_parse_err
+        return errors / total
+    
+    def get_success_rate(self) -> float:
+        """获取成功率"""
+        total = self.rx_frames
+        if total == 0:
+            return 0.0
+        return self.rx_frames_ok / total
+    
+    def get_uptime(self) -> float:
+        """获取运行时间（秒）"""
+        if self.connect_time is None:
+            return 0.0
+        return time.time() - self.connect_time
+    
+    def get_avg_latency(self) -> float:
+        """获取平均延迟（毫秒）"""
+        if not self.latency_samples:
+            return 0.0
+        return sum(self.latency_samples) / len(self.latency_samples)
+    
+    def get_signal_quality(self) -> float:
+        """获取信号质量（0-100）"""
+        # 基于成功率和错误率计算信号质量
+        success_rate = self.get_success_rate()
+        error_rate = self.get_error_rate()
+        
+        # 信号质量 = 成功率 * (1 - 错误率) * 100
+        quality = success_rate * (1 - error_rate) * 100
+        return min(100.0, max(0.0, quality))
+    
+    def record_rx(self, size: int):
+        """记录接收"""
+        self.rx_bytes += size
+        self.rx_rate_window.append((time.time(), size))
+    
+    def record_tx(self, size: int):
+        """记录发送"""
+        self.tx_bytes += size
+        self.tx_rate_window.append((time.time(), size))
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典"""
+        return {
+            'uptime': self.get_uptime(),
+            'rx_bytes': self.rx_bytes,
+            'rx_frames': self.rx_frames,
+            'rx_frames_ok': self.rx_frames_ok,
+            'rx_crc_errors': self.rx_frames_crc_err,
+            'rx_parse_errors': self.rx_frames_parse_err,
+            'rx_rate_bps': self.get_rx_rate(),
+            'tx_bytes': self.tx_bytes,
+            'tx_frames': self.tx_frames,
+            'tx_failed': self.tx_frames_failed,
+            'tx_rate_bps': self.get_tx_rate(),
+            'success_rate': self.get_success_rate(),
+            'error_rate': self.get_error_rate(),
+            'signal_quality': self.get_signal_quality(),
+            'avg_latency_ms': self.get_avg_latency(),
+            'disconnect_count': self.disconnect_count,
+            'reconnect_count': self.reconnect_count,
+            'frame_types': dict(self.frame_type_stats),
+        }
 
 
 class ProtocolConfig:
-    """协议配置类 - 在这里修改你的协议定义"""
+    """协议配置类"""
     
-    # ============ 修改区域开始 ============
-    
-    # 帧头定义
     HEADER_CMD = b'\xA1\xA2\xA3\xA4'
     HEADER_STATE = b'\xA5\xA6\xA7\xA8'
     
-    # 发送命令时使用的帧头
     SEND_HEADER = HEADER_CMD
-    
-    # CRC多项式（如果需要更改CRC算法，修改 _calc_crc8 方法）
     CRC_POLYNOMIAL = 0x07
     
-    # 蓝牙UUID配置
     BLE_SERVICE_UUID = "0000abb0-0000-1000-8000-00805f9b34fb"
-    BLE_CHAR_STATE_UUID = "0000abb1-0000-1000-8000-00805f9b34fb"  # 接收状态推送
-    BLE_CHAR_WRITE_UUID = "0000abb2-0000-1000-8000-00805f9b34fb"  # 发送命令
-    BLE_CHAR_READ_UUID = "0000abb3-0000-1000-8000-00805f9b34fb"   # 接收命令回复
+    BLE_CHAR_STATE_UUID = "0000abb1-0000-1000-8000-00805f9b34fb"
+    BLE_CHAR_WRITE_UUID = "0000abb2-0000-1000-8000-00805f9b34fb"
+    BLE_CHAR_READ_UUID = "0000abb3-0000-1000-8000-00805f9b34fb"
     
-    # 帧结构定义（添加新的帧类型只需在这里添加）
     FRAME_CONFIGS = [
         FrameConfig(
             header=HEADER_CMD,
-            frame_size=21,      # 4(header) + 16(payload) + 1(crc)
-            payload_format="16s",  # 16字节原始数据
+            frame_size=21,
+            payload_format="16s",
             queue_name="cmd_response",
             description="命令响应帧"
         ),
         FrameConfig(
             header=HEADER_STATE,
-            frame_size=61,      # 4(header) + 56(payload) + 1(crc)
-            payload_format="<28H",  # 28个uint16小端
+            frame_size=61,
+            payload_format="<28H",
             queue_name="motor_state",
             description="电机状态帧"
         ),
-        # 添加新的帧类型示例：
-        # FrameConfig(
-        #     header=b'\xB1\xB2\xB3\xB4',
-        #     frame_size=33,
-        #     payload_format="<4f3H2B",  # 4个float + 3个uint16 + 2个uint8
-        #     queue_name="sensor_data",
-        #     description="传感器数据帧"
-        # ),
     ]
     
-    # 发送命令的payload格式
     SEND_PAYLOAD_SIZE = 16
-    SEND_PAYLOAD_FORMAT = "16s"  # 可以改成其他格式，如 "<4f" (4个float)
-    
-    # ============ 修改区域结束 ============
+    SEND_PAYLOAD_FORMAT = "16s"
     
     @classmethod
     def get_frame_by_header(cls, header: bytes) -> Optional[FrameConfig]:
-        """根据帧头查找帧配置"""
         for config in cls.FRAME_CONFIGS:
             if config.header == header:
                 return config
@@ -133,16 +249,16 @@ class ProtocolConfig:
     
     @classmethod
     def get_all_headers(cls) -> List[bytes]:
-        """获取所有帧头"""
         return [config.header for config in cls.FRAME_CONFIGS]
 
 
 class FakeSerial:
-    """支持蓝牙和串口的双模通信类"""
+    """支持蓝牙和串口的双模通信类（带统计功能）"""
     
     def __init__(self, port_or_mac: str, baudrate: int = 921600, 
                  bluetooth: bool = False, debug: bool = True,
-                 protocol_config: type = ProtocolConfig):
+                 protocol_config: type = ProtocolConfig,
+                 enable_stats: bool = True):
         """
         初始化通信类
         
@@ -151,14 +267,20 @@ class FakeSerial:
             baudrate: 波特率（仅串口模式）
             bluetooth: 是否使用蓝牙模式
             debug: 是否输出调试信息
-            protocol_config: 协议配置类（可以传入自定义配置）
+            protocol_config: 协议配置类
+            enable_stats: 是否启用统计功能
         """
         self.bluetooth = bluetooth
         self.debug = debug
         self.running = True
         self.protocol = protocol_config
+        self.enable_stats = enable_stats
         
-        # 动态创建队列（根据配置）
+        # 统计对象
+        self.stats = Statistics() if enable_stats else None
+        self._stats_lock = threading.Lock()
+        
+        # 动态创建队列
         self.queues: Dict[str, queue.Queue] = {}
         for config in self.protocol.FRAME_CONFIGS:
             self.queues[config.queue_name] = queue.Queue(maxsize=100)
@@ -167,7 +289,7 @@ class FakeSerial:
         self.buffer = bytearray()
         self._buffer_lock = threading.Lock()
         
-        # 创建帧头到配置的映射（加速查找）
+        # 创建帧头到配置的映射
         self._header_map: Dict[bytes, FrameConfig] = {
             config.header: config for config in self.protocol.FRAME_CONFIGS
         }
@@ -186,6 +308,15 @@ class FakeSerial:
         )
         self.parse_thread.start()
         
+        # 启动统计显示线程（可选）
+        if enable_stats:
+            self.stats_thread = threading.Thread(
+                target=self._stats_display_loop,
+                daemon=True,
+                name="StatsThread"
+            )
+            # self.stats_thread.start()  # 取消注释以启用自动打印统计
+        
         self._log(f"[INIT] 协议配置加载完成，支持 {len(self.protocol.FRAME_CONFIGS)} 种帧类型")
 
     def _init_serial(self, port: str, baudrate: int):
@@ -196,6 +327,9 @@ class FakeSerial:
         self._log(f"[INIT] 正在打开串口: {port}")
         self.ser = Serial(port, baudrate, timeout=0.01, write_timeout=0.01)
         self._log(f"[INIT] 串口已打开: {port} @ {baudrate}")
+        
+        if self.enable_stats:
+            self.stats.connect_time = time.time()
 
     def _init_bluetooth(self, mac: str):
         """初始化蓝牙连接"""
@@ -205,7 +339,6 @@ class FakeSerial:
         self._loop_ref = None
         self._client_ref = None
         
-        # 启动蓝牙事件循环线程
         self.bt_loop_thread = threading.Thread(
             target=self._start_bt_loop, 
             daemon=True, 
@@ -213,7 +346,6 @@ class FakeSerial:
         )
         self.bt_loop_thread.start()
         
-        # 等待事件循环初始化（带超时）
         timeout = 5
         start_time = time.time()
         while self._loop_ref is None:
@@ -256,9 +388,17 @@ class FakeSerial:
                     self._client_ref = client
                     self._log(f"[BLE] 已连接 {self.mac}")
                     
+                    # 统计：连接成功
+                    if self.enable_stats:
+                        with self._stats_lock:
+                            if self.stats.connect_time is None:
+                                self.stats.connect_time = time.time()
+                            else:
+                                self.stats.reconnect_count += 1
+                    
                     retry_count = 0
                     
-                    # 订阅通知特征（根据配置动态订阅）
+                    # 订阅通知特征
                     if hasattr(self.protocol, 'BLE_CHAR_READ_UUID'):
                         await client.start_notify(
                             self.protocol.BLE_CHAR_READ_UUID, 
@@ -291,15 +431,29 @@ class FakeSerial:
                                 response=False
                             )
                             
+                            # 统计：发送成功
+                            if self.enable_stats:
+                                with self._stats_lock:
+                                    self.stats.record_tx(len(data))
+                            
                         except asyncio.TimeoutError:
                             continue
                         except Exception as e:
                             self._log(f"[BLE_WRITE_ERR] {e}")
+                            # 统计：发送失败
+                            if self.enable_stats:
+                                with self._stats_lock:
+                                    self.stats.tx_frames_failed += 1
                             break
                             
             except Exception as e:
                 if not self.running:
                     break
+                
+                # 统计：断开连接
+                if self.enable_stats:
+                    with self._stats_lock:
+                        self.stats.disconnect_count += 1
                 
                 retry_count += 1
                 if retry_count >= max_retries:
@@ -315,17 +469,22 @@ class FakeSerial:
     def _on_disconnect(self, client):
         """蓝牙断开回调"""
         self._log(f"[BLE] 设备已断开: {client.address}")
+        if self.enable_stats:
+            with self._stats_lock:
+                self.stats.disconnect_count += 1
 
     def _ble_data_handler(self, sender, data: bytearray):
         """蓝牙数据接收回调"""
         with self._buffer_lock:
             self.buffer.extend(data)
+        
+        # 统计：接收字节
+        if self.enable_stats:
+            with self._stats_lock:
+                self.stats.record_rx(len(data))
 
     def _calc_crc8(self, data: bytes) -> int:
-        """CRC8校验计算
-        
-        如果需要更改CRC算法，修改这个方法
-        """
+        """CRC8校验计算"""
         crc = 0x00
         polynomial = self.protocol.CRC_POLYNOMIAL
         
@@ -345,8 +504,14 @@ class FakeSerial:
             # 从传输层读取数据
             if not self.bluetooth:
                 if self.ser.in_waiting > 0:
+                    data = self.ser.read(self.ser.in_waiting)
                     with self._buffer_lock:
-                        self.buffer.extend(self.ser.read(self.ser.in_waiting))
+                        self.buffer.extend(data)
+                    
+                    # 统计：接收字节
+                    if self.enable_stats:
+                        with self._stats_lock:
+                            self.stats.record_rx(len(data))
                 else:
                     time.sleep(0.001)
             else:
@@ -369,17 +534,14 @@ class FakeSerial:
                     header_positions[pos] = header
             
             if not header_positions:
-                # 未找到任何帧头，保留末尾3字节
                 if len(self.buffer) > 3:
                     del self.buffer[:-3]
                 break
             
-            # 找到最近的帧头
             first_pos = min(header_positions.keys())
             if first_pos > 0:
                 del self.buffer[:first_pos]
             
-            # 获取当前帧头对应的配置
             current_header = header_positions[first_pos]
             frame_config = self._header_map.get(current_header)
             
@@ -387,38 +549,39 @@ class FakeSerial:
                 break
 
     def _parse_frame(self, config: FrameConfig) -> bool:
-        """通用帧解析方法
-        
-        Args:
-            config: 帧配置
-            
-        Returns:
-            bool: 是否继续解析（False表示数据不足，需要等待）
-        """
+        """通用帧解析方法"""
         if len(self.buffer) < config.frame_size:
             return False
         
         frame = bytes(self.buffer[:config.frame_size])
         
+        # 统计：接收到一帧
+        if self.enable_stats:
+            with self._stats_lock:
+                self.stats.rx_frames += 1
+        
         # CRC校验
         if self._calc_crc8(frame[:-1]) != frame[-1]:
             self._log(f"[CRC_ERR] {config.description} 校验失败")
+            
+            # 统计：CRC错误
+            if self.enable_stats:
+                with self._stats_lock:
+                    self.stats.rx_frames_crc_err += 1
+            
             del self.buffer[:1]
             return True
         
-        # 提取payload（跳过header和crc）
+        # 提取payload
         header_len = len(config.header)
         payload_bytes = frame[header_len:-1]
         
         # 解析payload
         try:
             if config.payload_format == "raw":
-                # 原始字节
                 parsed_data = payload_bytes
             else:
-                # 使用struct解析
                 parsed_data = struct.unpack(config.payload_format, payload_bytes)
-                # 如果只有一个元素，解包
                 if len(parsed_data) == 1:
                     parsed_data = parsed_data[0]
             
@@ -428,33 +591,96 @@ class FakeSerial:
                 try:
                     target_queue.put_nowait(parsed_data)
                 except queue.Full:
-                    # 队列满，丢弃旧数据
                     try:
                         target_queue.get_nowait()
                         target_queue.put_nowait(parsed_data)
                     except queue.Empty:
                         pass
             
+            # 统计：解析成功
+            if self.enable_stats:
+                with self._stats_lock:
+                    self.stats.rx_frames_ok += 1
+                    frame_type = config.queue_name
+                    self.stats.frame_type_stats[frame_type] = \
+                        self.stats.frame_type_stats.get(frame_type, 0) + 1
+            
             del self.buffer[:config.frame_size]
             
         except struct.error as e:
             self._log(f"[PARSE_ERR] {config.description} 解析失败: {e}")
+            
+            # 统计：解析错误
+            if self.enable_stats:
+                with self._stats_lock:
+                    self.stats.rx_frames_parse_err += 1
+            
             del self.buffer[:1]
         
         return True
 
-    # ========== 高层API：根据配置自动生成 ==========
+    def _stats_display_loop(self):
+        """统计显示循环（每5秒打印一次）"""
+        while self.running:
+            time.sleep(5)
+            if self.enable_stats:
+                self.print_stats()
+
+    # ========== 统计相关API ==========
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """获取统计信息"""
+        if not self.enable_stats:
+            return {}
+        
+        with self._stats_lock:
+            return self.stats.to_dict()
+    
+    def print_stats(self, detailed: bool = False):
+        """打印统计信息"""
+        if not self.enable_stats:
+            print("统计功能未启用")
+            return
+        
+        stats = self.get_stats()
+        
+        print("\n" + "="*60)
+        print(f"通信统计 (运行时间: {stats['uptime']:.1f}s)")
+        print("="*60)
+        print(f"信号质量: {stats['signal_quality']:.1f}%")
+        print(f"成功率:   {stats['success_rate']*100:.2f}%")
+        print(f"错误率:   {stats['error_rate']*100:.2f}%")
+        print("-"*60)
+        print(f"接收: {stats['rx_bytes']} 字节, {stats['rx_frames_ok']} 帧")
+        print(f"      速率: {stats['rx_rate_bps']:.1f} B/s")
+        print(f"      CRC错误: {stats['rx_crc_errors']}, 解析错误: {stats['rx_parse_errors']}")
+        print(f"发送: {stats['tx_bytes']} 字节, {stats['tx_frames']} 帧")
+        print(f"      速率: {stats['tx_rate_bps']:.1f} B/s")
+        print(f"      失败: {stats['tx_failed']}")
+        
+        if self.bluetooth:
+            print(f"连接: 断开 {stats['disconnect_count']} 次, 重连 {stats['reconnect_count']} 次")
+        
+        if detailed and stats['frame_types']:
+            print("-"*60)
+            print("帧类型统计:")
+            for frame_type, count in stats['frame_types'].items():
+                rate = count / stats['uptime'] if stats['uptime'] > 0 else 0
+                print(f"  {frame_type}: {count} 帧 ({rate:.1f} 帧/秒)")
+        
+        print("="*60 + "\n")
+    
+    def reset_stats(self):
+        """重置统计信息"""
+        if self.enable_stats:
+            with self._stats_lock:
+                self.stats = Statistics()
+                self.stats.connect_time = time.time()
+
+    # ========== 高层API ==========
     
     def get_data(self, queue_name: str, timeout: float = 1.0) -> Any:
-        """从指定队列读取数据（阻塞）
-        
-        Args:
-            queue_name: 队列名称（如 'cmd_response', 'motor_state'）
-            timeout: 超时时间
-            
-        Returns:
-            解析后的数据，超时返回None
-        """
+        """从指定队列读取数据（阻塞）"""
         target_queue = self.queues.get(queue_name)
         if not target_queue:
             raise ValueError(f"Unknown queue name: {queue_name}")
@@ -465,14 +691,7 @@ class FakeSerial:
             return None
 
     def get_latest_data(self, queue_name: str) -> Any:
-        """获取指定队列的最新数据（非阻塞）
-        
-        Args:
-            queue_name: 队列名称
-            
-        Returns:
-            最新数据，队列为空返回None
-        """
+        """获取指定队列的最新数据（非阻塞）"""
         target_queue = self.queues.get(queue_name)
         if not target_queue:
             raise ValueError(f"Unknown queue name: {queue_name}")
@@ -485,8 +704,6 @@ class FakeSerial:
                 break
         return latest
 
-    # ========== 兼容旧API ==========
-    
     def read(self, size: int = 16, timeout: float = 1.0) -> bytes:
         """读取命令响应包（兼容旧代码）"""
         data = self.get_data('cmd_response', timeout)
@@ -496,17 +713,8 @@ class FakeSerial:
         """获取最新的电机状态包（兼容旧代码）"""
         return self.get_latest_data('motor_state')
 
-    # ========== 发送方法 ==========
-    
     def write(self, payload: bytes) -> int:
-        """发送命令
-        
-        Args:
-            payload: payload数据（长度由配置决定）
-        
-        Returns:
-            int: 实际发送的字节数
-        """
+        """发送命令"""
         expected_size = self.protocol.SEND_PAYLOAD_SIZE
         if len(payload) != expected_size:
             raise ValueError(f"payload must be {expected_size} bytes, got {len(payload)}")
@@ -516,11 +724,16 @@ class FakeSerial:
         crc = self._calc_crc8(full_frame)
         final_packet = full_frame + struct.pack("B", crc)
         
+        # 统计：发送帧
+        if self.enable_stats:
+            with self._stats_lock:
+                self.stats.tx_frames += 1
+        
         if self.bluetooth:
             if not self._loop_ref or not self._loop_ref.is_running():
                 raise RuntimeError("蓝牙事件循环未运行")
             
-            # 清空写队列（只保留最新命令）
+            # 清空写队列
             while True:
                 try:
                     self.ble_write_queue.get_nowait()
@@ -537,29 +750,31 @@ class FakeSerial:
                 future.result(timeout=1.0)
             except Exception as e:
                 self._log(f"[WRITE_ERR] 蓝牙写入失败: {e}")
+                if self.enable_stats:
+                    with self._stats_lock:
+                        self.stats.tx_frames_failed += 1
                 return 0
         else:
             try:
                 self.ser.write(final_packet)
+                
+                # 统计：发送字节（串口模式）
+                if self.enable_stats:
+                    with self._stats_lock:
+                        self.stats.record_tx(len(final_packet))
             except Exception as e:
                 self._log(f"[WRITE_ERR] 串口写入失败: {e}")
+                if self.enable_stats:
+                    with self._stats_lock:
+                        self.stats.tx_frames_failed += 1
                 return 0
         
         return len(final_packet)
 
     def write_structured(self, format_str: str, *values) -> int:
-        """发送结构化数据
-        
-        Args:
-            format_str: struct格式字符串，如 "<4f" 表示4个小端float
-            *values: 要发送的值
-            
-        Example:
-            conn.write_structured("<4f", 1.0, 2.0, 3.0, 4.0)
-        """
+        """发送结构化数据"""
         payload = struct.pack(format_str, *values)
         
-        # 检查是否需要填充
         expected_size = self.protocol.SEND_PAYLOAD_SIZE
         if len(payload) < expected_size:
             payload += b'\x00' * (expected_size - len(payload))
@@ -575,7 +790,6 @@ class FakeSerial:
         with self._buffer_lock:
             self.buffer.clear()
         
-        # 清空所有队列
         for q in self.queues.values():
             while True:
                 try:
