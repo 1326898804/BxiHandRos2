@@ -15,7 +15,7 @@ colcon build
 source install/setup.bash
 ```
 
-###3.启动控制节点
+### 3.启动控制节点
 
 #### usb模式
 ```bash
