@@ -253,7 +253,7 @@ class ProtocolConfig:
 
 
 class FakeSerial:
-    """支持蓝牙和串口的双模通信类（带统计功能）"""
+    """支持蓝牙和串口的双模通信"""
     
     def __init__(self, port_or_mac: str, baudrate: int = 921600, 
                  bluetooth: bool = False, debug: bool = True,
@@ -308,7 +308,7 @@ class FakeSerial:
         )
         self.parse_thread.start()
         
-        # 启动统计显示线程（可选）
+        # 启动统计显示线程
         if enable_stats:
             self.stats_thread = threading.Thread(
                 target=self._stats_display_loop,
