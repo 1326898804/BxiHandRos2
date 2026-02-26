@@ -2,13 +2,13 @@
 
 ## 快速开始
 
-###1.克隆此仓库至Ros的工作区
+### 1.克隆此仓库至Ros的工作区
 
 ```bash
 git clone https://github.com/1326898804/BxiHandRos2.git
 ```
 
-###2.编译工作区
+### 2.编译工作区
 
 ```bash
 colcon build
@@ -17,7 +17,7 @@ source install/setup.bash
 
 ###3.启动控制节点
 
-####usb模式
+#### usb模式
 ```bash
 ros2 run aero_hand_open aero_hand_node --ros-args -p left_port:="/dev/ttyACM0" -p right_port:="/dev/ttyACM1" -p bluetooth:=False
 ```
@@ -34,7 +34,7 @@ Node(
     ]
 )
 ```
-####蓝牙模式
+#### 蓝牙模式
 在终端中执行
 ```bash
 ros2 run aero_hand_open aero_hand_node --ros-args -p left_port:="10:B4:1D:E9:9A:2A" -p right_port:="90:70:69:12:73:26" -p bluetooth:=True
@@ -62,7 +62,7 @@ ros2 topic list
 /right/joint_control #右手电机控制
 ```
 
-###4.测试
+### 4.测试
 
 回到初始状态
 ```bash
@@ -75,7 +75,7 @@ ros2 topic pub /right/joint_control aero_hand_open_msgs/JointControl "{header: {
 ros2 topic pub /right/joint_control aero_hand_open_msgs/JointControl "{header: {stamp: {sec: 0, nanosec: 0}}, target_positions: [1.745,0.0,1.571,0.662,1.571,1.571,1.571,1.571,1.571,1.571,1.571,1.571,1.571,1.571,1.571,1.571]}" --once
 ```
 
-####python example
+#### python example
 ```python
 import rclpy
 from rclpy.node import Node
